@@ -13,6 +13,7 @@ let workers = [];          // Owner-only: full staff roster (sales_rep + manager
 let stations = [];
 let transactions = [];
 let remittances = [];
+let pendingApprovals = { employees: [], states: [], outlets: [], games: [] }; // Owner-only
 let currentUser = null;    // {role: 'owner'|'manager'|'sales_rep', id, name, branchId}
 let activeTab = null;
 let timerInterval = null;
@@ -85,9 +86,32 @@ async function loadWorkers(){
   if(await fatalIfError(error, 'Loading staff')) return;
   workers = data || [];
 }
+async function loadPendingApprovals(){
+  // Owner-only, per the approval workflow established across Stages 3-5:
+  // a record is "pending" either because it's brand new (status =
+  // pending_approval) or because a General Manager/Branch Supervisor
+  // requested an activate/deactivate/transfer on an existing one
+  // (pending_action is set, status stays whatever it currently is).
+  const [empRes, stateRes, outletRes, gameRes] = await Promise.all([
+    supabase.from('profiles').select('*').eq('status', 'pending_approval'),
+    supabase.from('states').select('*').or('status.eq.pending_approval,pending_action.not.is.null'),
+    supabase.from('outlets').select('*').or('status.eq.pending_approval,pending_action.not.is.null'),
+    supabase.from('games').select('*').or('status.eq.pending_approval,pending_action.not.is.null'),
+  ]);
+  pendingApprovals = {
+    employees: empRes.data || [],
+    states: stateRes.data || [],
+    outlets: outletRes.data || [],
+    games: gameRes.data || [],
+  };
+}
+function pendingApprovalsCount(){
+  const p = pendingApprovals;
+  return p.employees.length + p.states.length + p.outlets.length + p.games.length;
+}
 async function loadBranchData(){
   const tasks = [loadStations(), loadTransactions(), loadRemittances()];
-  if(currentUser.role === 'owner') tasks.push(loadWorkers());
+  if(currentUser.role === 'owner') tasks.push(loadWorkers(), loadPendingApprovals());
   await Promise.all(tasks);
 }
 
@@ -103,6 +127,19 @@ function subscribeRealtime(){
       renderRoot();
     });
   });
+  if(currentUser.role === 'owner'){
+    // No branch filter here — Owner needs to see requests from every
+    // outlet, and the tab badge should update the instant a General
+    // Manager or Branch Supervisor submits something, not just when
+    // the Owner happens to click into the Approvals tab.
+    ['profiles','states','outlets','games'].forEach(table=>{
+      ch.on('postgres_changes', { event: '*', schema: 'public', table }, async ()=>{
+        await loadPendingApprovals();
+        if(activeTab === 'approvals') renderApprovalsList();
+        else renderRoot(); // re-render shell so the tab badge count refreshes
+      });
+    });
+  }
   ch.subscribe();
   realtimeChannel = ch;
 }
@@ -424,18 +461,28 @@ function renderBranchShell(){
   else renderBranchReconciliation();
 }
 
-const OWNER_TABS = [
+const OWNER_TABS_BASE = [
   {id:'dashboard', label:'Reconciliation'},
+  {id:'approvals', label:'Approvals'},
   {id:'transactions', label:'Transactions'},
   {id:'branches', label:'Branches'},
   {id:'workers', label:'Staff'},
   {id:'stations', label:'Stations'},
 ];
+function ownerTabs(){
+  const count = pendingApprovalsCount();
+  return OWNER_TABS_BASE.map(t=>{
+    if(t.id !== 'approvals' || count === 0) return t;
+    return { ...t, label: `${t.label}<span class="tab-badge">${count}</span>` };
+  });
+}
 function renderOwnerShell(){
-  if(!activeTab || !OWNER_TABS.find(t=>t.id===activeTab)) activeTab = 'dashboard';
-  root.innerHTML = shellHeader(OWNER_TABS);
+  const tabs = ownerTabs();
+  if(!activeTab || !tabs.find(t=>t.id===activeTab)) activeTab = 'dashboard';
+  root.innerHTML = shellHeader(tabs);
   bindShellChrome();
   if(activeTab==='dashboard') renderReconciliation(branches);
+  else if(activeTab==='approvals') renderApprovals();
   else if(activeTab==='transactions') renderAllTransactions();
   else if(activeTab==='branches') renderBranchesOverview();
   else if(activeTab==='workers') renderWorkersManage();
@@ -987,6 +1034,113 @@ function renderWorkersManage(){
       const { error } = await supabase.from('profiles').update({ [inp.dataset.field]: inp.value }).eq('id', inp.dataset.id);
       if(await fatalIfError(error, 'Updating staff member')) return;
       await loadWorkers();
+    });
+  });
+}
+
+// ================= OWNER: PENDING APPROVALS =================
+// Every entity type here (employees, states, outlets, games) follows
+// the same shape established across Stages 3-5: `status` is the
+// record's true current state, `pending_action` marks an in-flight
+// request from a General Manager or Branch Supervisor that only takes
+// effect once the Owner approves it here. See the migration comments
+// in 0003/0004/0006 for the full design rationale.
+function approvalActionLabel(item){
+  if(item.status === 'pending_approval') return 'New';
+  if(item.pending_action === 'activate') return 'Activate';
+  if(item.pending_action === 'deactivate') return 'Deactivate';
+  if(item.pending_action === 'transfer') return 'Transfer';
+  return 'Change';
+}
+
+function approvalCard(kind, item, title, sub){
+  return `
+    <div class="approval-card" data-kind="${kind}" data-id="${item.id}">
+      <div class="approval-info">
+        <span class="approval-pill">${approvalActionLabel(item)}</span>
+        <div class="approval-title">${title}</div>
+        ${sub ? `<div class="approval-sub">${sub}</div>` : ''}
+      </div>
+      <div class="approval-actions">
+        <button class="btn-approve" data-action="approve">Approve</button>
+        <button class="btn-reject" data-action="reject">Reject</button>
+      </div>
+    </div>`;
+}
+
+async function renderApprovals(){
+  bodyEl.innerHTML = `
+    <div class="section-title"><div><h2>Pending Approvals</h2><p>Requests from your General Managers and Branch Supervisors, waiting on your review</p></div></div>
+    <div class="empty-state">Loading...</div>`;
+  await loadPendingApprovals();
+  renderApprovalsList();
+}
+
+function renderApprovalsList(){
+  const { employees, states, outlets, games } = pendingApprovals;
+  const total = pendingApprovalsCount();
+
+  let html = `<div class="section-title"><div><h2>Pending Approvals</h2><p>${total} item${total!==1?'s':''} waiting on your review</p></div></div>`;
+
+  if(total === 0){
+    html += `<div class="empty-state">Nothing pending right now &mdash; you're all caught up.</div>`;
+    bodyEl.innerHTML = html;
+    return;
+  }
+
+  if(employees.length){
+    html += `<div class="approval-group-title">Employees</div><div class="approval-list">` +
+      employees.map(e=>approvalCard('employee', e, e.full_name,
+        `${roleLabel(e.role)}${e.requested_at ? ' &middot; requested '+new Date(e.requested_at).toLocaleDateString() : ''}`)).join('') +
+      `</div>`;
+  }
+  if(states.length){
+    html += `<div class="approval-group-title">States</div><div class="approval-list">` +
+      states.map(s=>approvalCard('state', s, s.name,
+        s.requested_at ? `Requested ${new Date(s.requested_at).toLocaleDateString()}` : '')).join('') +
+      `</div>`;
+  }
+  if(outlets.length){
+    html += `<div class="approval-group-title">Outlets</div><div class="approval-list">` +
+      outlets.map(o=>approvalCard('outlet', o, o.name,
+        o.requested_at ? `Requested ${new Date(o.requested_at).toLocaleDateString()}` : '')).join('') +
+      `</div>`;
+  }
+  if(games.length){
+    html += `<div class="approval-group-title">Games</div><div class="approval-list">` +
+      games.map(g=>approvalCard('game', g, g.name,
+        g.pending_action==='transfer' ? 'Transfer to another outlet requested' :
+        (g.requested_at ? `Requested ${new Date(g.requested_at).toLocaleDateString()}` : ''))).join('') +
+      `</div>`;
+  }
+
+  bodyEl.innerHTML = html;
+
+  const RPC_MAP = {
+    employee: { approve: 'approve_employee', reject: 'reject_employee' },
+    state:    { approve: 'approve_state',    reject: 'reject_state' },
+    outlet:   { approve: 'approve_outlet',   reject: 'reject_outlet' },
+    game:     { approve: 'approve_game',     reject: 'reject_game' },
+  };
+
+  bodyEl.querySelectorAll('.approval-card').forEach(card=>{
+    card.querySelectorAll('button[data-action]').forEach(btn=>{
+      btn.addEventListener('click', async ()=>{
+        const kind = card.dataset.kind;
+        const id = card.dataset.id;
+        const action = btn.dataset.action;
+        card.querySelectorAll('button').forEach(b=>b.disabled = true);
+        btn.textContent = action === 'approve' ? 'Approving...' : 'Rejecting...';
+
+        const { error } = await supabase.rpc(RPC_MAP[kind][action], { p_id: id });
+        if(await fatalIfError(error, `${action === 'approve' ? 'Approving' : 'Rejecting'} this ${kind}`)){
+          card.querySelectorAll('button').forEach(b=>b.disabled = false);
+          btn.textContent = action === 'approve' ? 'Approve' : 'Reject';
+          return;
+        }
+        await loadPendingApprovals();
+        renderApprovalsList();
+      });
     });
   });
 }
