@@ -133,7 +133,7 @@ export async function handleCreateEmployee(request, env) {
   // 3. Confirm the target outlet is real, active, and in the caller's company.
   const { data: outlet, error: outletError } = await admin
     .from('outlets')
-    .select('id, company_id, status')
+    .select('id, company_id, status, branch_id')
     .eq('id', outlet_id)
     .single();
 
@@ -159,6 +159,12 @@ export async function handleCreateEmployee(request, env) {
 
   // 5. Insert profiles + employee_details. If either fails, roll back
   // the auth user so we never leave an orphaned login with no profile.
+  //
+  // branch_id is included when the outlet has one linked (true for the
+  // three original legacy branches) so Phase 1's branch-scoped screens
+  // can still see this employee. New outlets with no legacy branch
+  // link simply leave it null — outlet_id alone satisfies the
+  // database constraint as of the 0005 hotfix.
   try {
     const { error: profileError } = await admin.from('profiles').insert({
       id: newUserId,
@@ -166,6 +172,7 @@ export async function handleCreateEmployee(request, env) {
       role,
       company_id: callerProfile.company_id,
       outlet_id,
+      branch_id: outlet.branch_id || null,
       status: 'pending_approval',
     });
     if (profileError) throw profileError;
