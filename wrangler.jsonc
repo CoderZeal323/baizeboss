@@ -1,0 +1,10 @@
+{
+  "name": "baizeboss",
+  "compatibility_date": "2026-07-09",
+  "main": "worker.js",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  }
+}
